@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -31,7 +33,7 @@ func (s *APIServer) Run() {
 	router.HandleFunc("/account", makeHttpHandleFunc(s.handleAccount))
 	router.HandleFunc("/account/{id}", withJWTAuth(makeHttpHandleFunc(s.handleGetAccountByID), accountNumberCheckCallback(s.store))).Methods("GET")
 	router.HandleFunc("/account/{id}", makeHttpHandleFunc(s.handleDeleteAccount)).Methods("DELETE")
-	router.HandleFunc("/transfer", makeHttpHandleFunc(s.handleTransfer)).Methods("POST")
+	router.HandleFunc("/transfer", withJWTAuth(makeHttpHandleFunc(s.handleTransfer), accountNumberCheckCallback(s.store))).Methods("POST")
 
 	log.Println("JSON API server running on port: ", s.listenAddr)
 	http.ListenAndServe(s.listenAddr, router)
@@ -144,14 +146,38 @@ func (s *APIServer) handleDeleteAccount(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *APIServer) handleTransfer(w http.ResponseWriter, r *http.Request) error {
-	// transferReq := &TransferRequest{}
-	transferReq := new(TransferRequest)
-	if err := json.NewDecoder(r.Body).Decode(transferReq); err != nil {
+
+	transferReq := TransferRequest{}
+	if err := json.NewDecoder(r.Body).Decode(&transferReq); err != nil {
 		return err
 	}
+
 	defer r.Body.Close()
 
-	return WriteJSON(w, http.StatusOK, transferReq)
+	accFrom, err := s.store.GetAccountByNumber(int(transferReq.FromAccountNumber))
+	if err != nil {
+		return err
+	}
+
+	if accFrom.Balance < int64(transferReq.Amount) {
+		return fmt.Errorf("the account balance is not enough")
+	}
+
+	_, err = s.store.GetAccountByNumber(int(transferReq.ToAccountNumber))
+	if err != nil {
+		return err
+	}
+
+	err = s.store.SendMoney(transferReq.FromAccountNumber, transferReq.ToAccountNumber, transferReq.Amount)
+	if err != nil {
+		return err
+	}
+
+	responseMsg := TransferResponse{
+		Message: fmt.Sprintf("Successfully transferred %d units to account %d", transferReq.Amount, transferReq.ToAccountNumber),
+	}
+
+	return WriteJSON(w, http.StatusOK, responseMsg)
 }
 
 func WriteJSON(w http.ResponseWriter, status int, v any) error {
@@ -160,40 +186,6 @@ func WriteJSON(w http.ResponseWriter, status int, v any) error {
 
 	return json.NewEncoder(w).Encode(v)
 }
-
-// func withJWTAuth(handleFunc http.HandlerFunc, s Storage) http.HandlerFunc {
-// 	return func(w http.ResponseWriter, r *http.Request) {
-// 		fmt.Println("calling JWT auth middleware")
-
-// 		tokenString := r.Header.Get("x-jwt-token")
-// 		token, err := validateJWT(tokenString)
-
-// 		if err != nil {
-// 			permissionDenied(w)
-// 			return
-// 		}
-
-// 		userID, err := getID(r)
-// 		if err != nil {
-// 			permissionDenied(w)
-// 			return
-// 		}
-
-// 		account, err := s.GetAccountByID(userID)
-// 		if err != nil {
-// 			permissionDenied(w)
-// 			return
-// 		}
-
-// 		claims := token.Claims.(jwt.MapClaims)
-// 		if account.Number != int64(claims["accountNumber"].(float64)) {
-// 			permissionDenied(w)
-// 			return
-// 		}
-
-// 		handleFunc(w, r)
-// 	}
-// }
 
 func withJWTAuth(handleFunc http.HandlerFunc, callback AuthCallback) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -223,20 +215,42 @@ type AuthCallback func(r *http.Request, token *jwt.Token) error
 // Калбэк, который проверяет номер счета аккаунта из БД
 func accountNumberCheckCallback(s Storage) AuthCallback {
 	return func(r *http.Request, token *jwt.Token) error {
-		userID, err := getID(r)
+		account := &Account{}
+		requestBodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			return err
 		}
+		if r.Method == "GET" {
 
-		account, err := s.GetAccountByID(userID)
-		if err != nil {
-			return err
+			userID, err := getID(r)
+			if err != nil {
+				return err
+			}
+
+			account, err = s.GetAccountByID(userID)
+			if err != nil {
+				return err
+			}
+
+		}
+
+		if r.Method == "POST" {
+
+			transfer := TransferRequest{}
+			err := json.Unmarshal(requestBodyBytes, &transfer)
+			if err != nil {
+				return err
+			}
+			account.Number = int64(transfer.FromAccountNumber)
+
 		}
 
 		claims := token.Claims.(jwt.MapClaims)
 		if account.Number != int64(claims["accountNumber"].(float64)) {
 			return errors.New("account number mismatch")
 		}
+
+		r.Body = io.NopCloser(bytes.NewReader(requestBodyBytes))
 
 		return nil
 	}

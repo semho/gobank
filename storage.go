@@ -14,6 +14,7 @@ type Storage interface {
 	GetAccounts() ([]*Account, error)
 	GetAccountByID(int) (*Account, error)
 	GetAccountByNumber(int) (*Account, error)
+	SendMoney(int, int, int) error
 }
 
 type PostgressStore struct {
@@ -113,6 +114,33 @@ func (s *PostgressStore) GetAccountByID(id int) (*Account, error) {
 	}
 
 	return nil, fmt.Errorf("account %d not found", id)
+}
+
+func (s *PostgressStore) SendMoney(from, to, amount int) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+		err = tx.Commit()
+	}()
+
+	_, err = tx.Exec("update account set balance = balance - $1 where number = $2", amount, from)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec("update account set balance = balance + $1 where number = $2", amount, to)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (s *PostgressStore) GetAccounts() ([]*Account, error) {
